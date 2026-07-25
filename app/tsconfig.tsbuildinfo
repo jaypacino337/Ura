@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/chain/client.ts","./src/components/MiningRig.tsx","./src/components/Panels.tsx","./src/game/constants.ts","./src/game/demo.ts","./src/game/pow.ts","./src/game/rewards.ts","./src/game/types.ts","./src/game/useGame.ts","./src/lib/base58.ts","./src/lib/format.ts","./src/miner/useMiner.ts","./src/miner/worker.ts"],"version":"5.9.3"}

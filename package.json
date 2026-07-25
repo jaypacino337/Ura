@@ -1,0 +1,25 @@
+{
+  "name": "ura-mine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "URA — an Ore-style proof-of-work mining game on Solana",
+  "scripts": {
+    "test": "ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts",
+    "app:dev": "npm --prefix app run dev",
+    "app:build": "npm --prefix app run build"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.1",
+    "@noble/hashes": "^1.5.0",
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.95.8"
+  },
+  "devDependencies": {
+    "@types/chai": "^4.3.0",
+    "@types/mocha": "^10.0.0",
+    "chai": "^4.3.4",
+    "mocha": "^10.0.0",
+    "ts-mocha": "^10.0.0",
+    "typescript": "^5.6.3"
+  }
+}
