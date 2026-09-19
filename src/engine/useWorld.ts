@@ -1,8 +1,7 @@
 import { useEffect, useSyncExternalStore } from "react";
-import { store, type Snapshot } from "./store";
+import { store } from "./store";
 
-/** Subscribe a component to the live world; re-renders once per tick. */
-export function useWorld(): Snapshot {
+export function useWorld() {
   useEffect(() => {
     store.start();
   }, []);

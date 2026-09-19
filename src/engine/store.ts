@@ -1,26 +1,51 @@
-// Central game state + tick loop. One mutable world object, snapshotted into
-// React via useSyncExternalStore-style subscription.
+// The world: one live prospecting round at a time, a reserve that grows from
+// disclosed (simulated) creator fees, bot prospectors, and the user's mining
+// operation. All round outcomes come from src/engine/det.ts (commit-reveal),
+// so nothing in here can steer a settlement.
 
-import { makeToken, tickToken } from "./market";
-import { rankFeed } from "./rank";
 import {
-  BOT_HANDLES,
-  botPickToken,
-  makeBot,
-  makeCall,
-  randomThesis,
-  tickCalls,
-} from "./sim";
-import { gradeCall } from "./verdict";
-import type { Call, Caller, RankedCall, Token } from "./types";
+  commitmentFor,
+  deriveGrades,
+  deriveSurveyables,
+  hashHex,
+  randomSeed,
+  receiptHash,
+} from "./det";
+import {
+  EQUIPMENT,
+  FEE_SPLIT,
+  PLOTS,
+  TRANCHES,
+  type LedgerTx,
+  type Prospector,
+  type Reserve,
+  type Round,
+  type RoundResult,
+} from "./types";
 
-export const TICK_MS = 1000;
-const MAX_TOKENS = 14;
-const MAX_CALLS = 120;
+export const ROUND_OPEN_MS = 70_000;
+export const ROUND_LOCK_MS = 8_000; // claims frozen before settlement
+export const ROUND_SETTLED_MS = 10_000; // reveal display before next round
 
-// Mulberry32 — deterministic per session seed, fast enough to call constantly.
-function mulberry32(seed: number) {
-  let a = seed >>> 0;
+const BOTS: string[] = [
+  "atomic_annie",
+  "yellowcake_yuri",
+  "geiger_gary",
+  "dosimeter_dan",
+  "fissile_frank",
+  "breeder_beth",
+  "centrifuge_sal",
+  "halflife_hank",
+  "cherenkov_chad",
+  "oklo_operator",
+  "rad_roughneck",
+  "borehole_bob",
+  "tailings_tina",
+  "critical_carl",
+];
+
+function mulberry32(seedNum: number) {
+  let a = seedNum >>> 0;
   return () => {
     a |= 0;
     a = (a + 0x6d2b79f5) | 0;
@@ -31,197 +56,322 @@ function mulberry32(seed: number) {
 }
 
 export interface World {
-  tokens: Map<string, Token>;
-  calls: Call[];
-  callers: Map<string, Caller>;
-  user: Caller;
-  feed: RankedCall[];
-  startedAt: number;
-  solPrice: number;
+  round: Round;
+  history: Round[];
+  prospectors: Map<string, Prospector>;
+  user: Prospector;
+  reserve: Reserve;
+  ethPrice: number;
+  nnePrice: number;
+  usrPrice: number;
+  oreDiscovered: number;
+  feesToOps: number;
+  nextPoolUsdg: number;
+  cpm: number; // geiger counter, cosmetic
 }
 
-export interface Snapshot {
-  version: number;
-  world: World;
+interface PendingRound {
+  seed: string;
 }
-
-type Listener = () => void;
 
 class Store {
+  private rng = mulberry32(Date.now() ^ 0xf1551e);
   private world: World;
-  private rng = mulberry32(Date.now() ^ 0x5eed);
-  private listeners = new Set<Listener>();
+  private pending: PendingRound;
+  private listeners = new Set<() => void>();
+  private snapshot: { version: number; world: World };
   private version = 0;
-  private snapshot: Snapshot;
   private timer: number | null = null;
+  private roundSeq: number;
 
   constructor() {
-    this.world = this.boot();
-    this.snapshot = { version: this.version, world: this.world };
+    this.roundSeq = 140 + Math.floor(this.rng() * 20);
+    const { world, pending } = this.boot();
+    this.world = world;
+    this.pending = pending;
+    this.snapshot = { version: 0, world };
   }
 
-  /** Seed a believable world: tokens with pre-rolled history, bots mid-argument. */
-  private boot(): World {
-    const now = Date.now();
-    const tokens = new Map<string, Token>();
-    const callers = new Map<string, Caller>();
-    const calls: Call[] = [];
-
-    BOT_HANDLES.forEach((h, i) => {
-      const bot = makeBot(h, i);
-      callers.set(bot.id, bot);
-    });
-
-    const user: Caller = {
-      id: "you",
-      handle: "you",
-      avatarHue: 150,
-      isUser: true,
-      earnedSol: 0,
-      wins: 0,
-      losses: 0,
-      calls: 0,
+  private makeProspector(handle: string, i: number, isUser = false): Prospector {
+    return {
+      id: isUser ? "you" : `bot-${handle}`,
+      handle,
+      isUser,
+      hue: isUser ? 52 : (i * 41 + 90) % 360,
+      permits: isUser ? 6 : 99,
+      oreUnits: 0,
+      lifetimeOre: 0,
+      usr: isUser ? 2_500 : 0,
+      rewardsUsdg: 0,
+      strikes: 0,
+      claimsMade: 0,
+      equipmentTier: 0,
     };
-    callers.set(user.id, user);
+  }
 
-    // Pre-roll ~20 minutes of market so charts and calls have context.
-    const PREROLL_TICKS = 240;
-    const prerollStart = now - PREROLL_TICKS * 5000;
-    for (let i = 0; i < 9; i++) {
-      const t = makeToken(prerollStart - Math.floor(this.rng() * 3_600_000), this.rng);
-      tokens.set(t.id, t);
-    }
-    const tokenArr = () => [...tokens.values()];
-    const bots = [...callers.values()].filter((c) => !c.isUser);
-
-    for (let tick = 0; tick < PREROLL_TICKS; tick++) {
-      const t = prerollStart + tick * 5000;
-      for (const token of tokens.values()) tickToken(token, t, this.rng);
-      // Sprinkle historical calls.
-      if (this.rng() < 0.06 && calls.length < 40) {
-        const bot = bots[Math.floor(this.rng() * bots.length)];
-        const token = botPickToken(tokenArr(), this.rng);
-        if (token) calls.push(makeCall(bot, token, randomThesis(this.rng), t));
-      }
-      const order = calls.map((c) => c.id);
-      tickCalls(calls, tokens, callers, order, t, this.rng);
-    }
-
-    const world: World = {
-      tokens,
-      calls,
-      callers,
-      user,
-      feed: [],
+  private newRound(now: number, poolUsdg: number): { round: Round; pending: PendingRound } {
+    const seed = randomSeed();
+    const id = ++this.roundSeq;
+    const round: Round = {
+      id,
       startedAt: now,
-      solPrice: 190 + this.rng() * 30,
+      locksAt: now + ROUND_OPEN_MS,
+      settlesAt: now + ROUND_OPEN_MS + ROUND_LOCK_MS,
+      commitment: commitmentFor(id, seed),
+      poolUsdg,
+      status: "open",
+      claims: Array.from({ length: PLOTS }, () => []),
+      surveyHints: [],
+      result: null,
     };
-    world.feed = rankFeed(
-      calls.filter((c) => c.outcome === "open" || now - c.createdAt < 3_600_000),
-      tokens,
-      now
-    );
-    return world;
+    return { round, pending: { seed } };
+  }
+
+  private boot() {
+    const now = Date.now();
+    const prospectors = new Map<string, Prospector>();
+    BOTS.forEach((h, i) => {
+      const p = this.makeProspector(h, i);
+      prospectors.set(p.id, p);
+    });
+    const user = this.makeProspector("you", 0, true);
+    prospectors.set(user.id, user);
+
+    const reserve: Reserve = { eth: 0, usdg: 0, nne: 0, xu3o8: 0, ledger: [] };
+    const world: World = {
+      round: null as unknown as Round,
+      history: [],
+      prospectors,
+      user,
+      reserve,
+      ethPrice: 3_200 + this.rng() * 900,
+      nnePrice: 28 + this.rng() * 14,
+      usrPrice: 0.004 + this.rng() * 0.004,
+      oreDiscovered: 0,
+      feesToOps: 0,
+      nextPoolUsdg: 0,
+      cpm: 22,
+    };
+
+    // Pre-run settled rounds so the terminal boots with a history, a funded
+    // reserve, and bots with records — every past round fully verifiable.
+    const PRE = 9;
+    for (let k = 0; k < PRE; k++) {
+      const t = now - (PRE - k) * (ROUND_OPEN_MS + ROUND_LOCK_MS + ROUND_SETTLED_MS);
+      this.ingestFees(world, t);
+      const { round, pending } = this.newRound(t, world.nextPoolUsdg);
+      world.nextPoolUsdg = 0;
+      this.botClaims(round, world, 1);
+      this.settle(round, pending.seed, world, t + ROUND_OPEN_MS + ROUND_LOCK_MS);
+      world.history.unshift(round);
+    }
+
+    this.ingestFees(world, now);
+    const fresh = this.newRound(now, world.nextPoolUsdg);
+    world.nextPoolUsdg = 0;
+    world.round = fresh.round;
+    this.applySurveyHints(world, fresh.pending.seed);
+    return { world, pending: fresh.pending };
+  }
+
+  /** Simulated Pons creator-fee inflow, split per the published schedule. */
+  private ingestFees(world: World, t: number) {
+    const gross = 180 + this.rng() * 420; // USDG per round, sim
+    const toReserve = gross * FEE_SPLIT.reserve;
+    const toRewards = gross * FEE_SPLIT.rewards;
+    const toOps = gross * FEE_SPLIT.ops;
+
+    // Reserve acquisition alternates USDG / ETH, tiny periodic NNE adds.
+    const asEth = this.rng() < 0.4;
+    const push = (tx: Omit<LedgerTx, "hash">) =>
+      world.reserve.ledger.unshift({
+        ...tx,
+        hash: `0x${hashHex(`${tx.t}:${tx.kind}:${tx.amount}`).slice(0, 40)}`,
+      });
+
+    push({ t, kind: "fee_in", asset: "USDG", amount: gross, note: "creator fees (sim)" });
+    if (asEth) {
+      const eth = toReserve / world.ethPrice;
+      world.reserve.eth += eth;
+      push({ t, kind: "reserve_acq", asset: "ETH", amount: eth, note: "reserve acquisition" });
+    } else {
+      world.reserve.usdg += toReserve;
+      push({ t, kind: "reserve_acq", asset: "USDG", amount: toReserve, note: "reserve acquisition" });
+    }
+    if (this.rng() < 0.18) {
+      const spend = Math.min(world.reserve.usdg * 0.1, 120);
+      if (spend > 10) {
+        world.reserve.usdg -= spend;
+        const nne = spend / world.nnePrice;
+        world.reserve.nne += nne;
+        push({ t, kind: "nne_acq", asset: "NNE", amount: nne, note: "nuclear-sector exposure" });
+      }
+    }
+    world.nextPoolUsdg += toRewards;
+    world.feesToOps += toOps;
+    push({ t, kind: "reward_pool", asset: "USDG", amount: toRewards, note: "mining reward pool" });
+  }
+
+  private applySurveyHints(world: World, seed: string) {
+    const tier = EQUIPMENT[world.user.equipmentTier];
+    if (tier.surveyReveals > 0) {
+      world.round.surveyHints = deriveSurveyables(seed).slice(0, tier.surveyReveals);
+    }
+  }
+
+  /** Bots stake claims over the open window (or instantly during preroll). */
+  private botClaims(round: Round, world: World, instantAll: number) {
+    const bots = [...world.prospectors.values()].filter((p) => !p.isUser);
+    for (const bot of bots) {
+      if (instantAll < 1 && this.rng() > instantAll) continue;
+      const n = 1 + Math.floor(this.rng() * 3);
+      for (let i = 0; i < n; i++) {
+        const plot = Math.floor(this.rng() * PLOTS);
+        if (!round.claims[plot].includes(bot.id)) {
+          round.claims[plot].push(bot.id);
+          bot.claimsMade++;
+        }
+      }
+    }
+  }
+
+  private settle(round: Round, seed: string, world: World, t: number) {
+    const { strike, grades } = deriveGrades(seed);
+    const payouts: RoundResult["payouts"] = [];
+    let paidTotal = 0;
+
+    for (const tranche of TRANCHES) {
+      const plots = grades
+        .map((g, i) => (g === tranche.grade ? i : -1))
+        .filter((i) => i >= 0);
+      const claimants = plots.flatMap((p) =>
+        round.claims[p].map((id) => ({ id, plot: p }))
+      );
+      const trancheUsdg = round.poolUsdg * tranche.share;
+      if (claimants.length === 0) continue;
+      const each = trancheUsdg / claimants.length;
+      for (const { id, plot } of claimants) {
+        const p = world.prospectors.get(id);
+        if (!p) continue;
+        p.rewardsUsdg += each;
+        p.oreUnits += tranche.orePerClaim;
+        p.lifetimeOre += tranche.orePerClaim;
+        world.oreDiscovered += tranche.orePerClaim;
+        if (tranche.grade === "MOTHERLODE") p.strikes++;
+        payouts.push({ prospectorId: id, amountUsdg: each, ore: tranche.orePerClaim, plot });
+        paidTotal += each;
+      }
+    }
+
+    const rolled = Math.max(round.poolUsdg - paidTotal, 0);
+    if (rolled > 0.01) {
+      world.reserve.usdg += rolled;
+      world.reserve.ledger.unshift({
+        t,
+        kind: "rollover",
+        asset: "USDG",
+        amount: rolled,
+        note: `round #${round.id} unclaimed tranches → reserve`,
+        hash: `0x${hashHex(`${round.id}:rollover`).slice(0, 40)}`,
+      });
+    }
+
+    round.status = "settled";
+    round.result = {
+      strike,
+      grades,
+      seed,
+      payouts,
+      txHash: receiptHash(seed),
+      rolledToReserve: rolled,
+    };
   }
 
   start() {
     if (this.timer !== null) return;
-    this.timer = window.setInterval(() => this.tick(), TICK_MS);
-  }
-
-  stop() {
-    if (this.timer !== null) window.clearInterval(this.timer);
-    this.timer = null;
+    this.timer = window.setInterval(() => this.tick(), 1000);
   }
 
   private tick() {
     const w = this.world;
     const now = Date.now();
+    const r = w.round;
 
-    for (const token of w.tokens.values()) tickToken(token, now, this.rng);
+    // Prices drift.
+    w.ethPrice *= 1 + (this.rng() - 0.5) * 0.004;
+    w.nnePrice *= 1 + (this.rng() - 0.5) * 0.008;
+    w.usrPrice *= 1 + (this.rng() - 0.5) * 0.02;
 
-    // New launches keep the tape fresh; dead rugs age out.
-    if (w.tokens.size < MAX_TOKENS && this.rng() < 0.012) {
-      const t = makeToken(now, this.rng);
-      w.tokens.set(t.id, t);
-    }
-    for (const [id, token] of [...w.tokens.entries()]) {
-      const stale =
-        token.regime === "rugged" && now - token.launchedAt > 40 * 60_000;
-      const hasOpenCalls = w.calls.some(
-        (c) => c.tokenId === id && c.outcome === "open"
-      );
-      if (stale && !hasOpenCalls && w.tokens.size > 8) w.tokens.delete(id);
-    }
+    // Geiger: ambient jitter, hot as settlement approaches.
+    const toSettle = Math.max(r.settlesAt - now, 0);
+    const heat = toSettle < 15_000 ? (15_000 - toSettle) / 15_000 : 0;
+    w.cpm = Math.round(18 + this.rng() * 14 + heat * (160 + this.rng() * 120));
 
-    // Bots fire callouts.
-    if (this.rng() < 0.16) {
-      const bots = [...w.callers.values()].filter((c) => !c.isUser);
-      const bot = bots[Math.floor(this.rng() * bots.length)];
-      const token = botPickToken([...w.tokens.values()], this.rng);
-      if (token) {
-        w.calls.unshift(makeCall(bot, token, randomThesis(this.rng), now));
-      }
+    if (r.status === "open") {
+      // Bots trickle claims in.
+      if (this.rng() < 0.5) this.botClaims(r, w, 0.12);
+      if (now >= r.locksAt) r.status = "locked";
     }
-    if (w.calls.length > MAX_CALLS) {
-      // Drop oldest resolved calls first.
-      const resolved = w.calls.filter((c) => c.outcome !== "open");
-      resolved
-        .sort((a, b) => a.createdAt - b.createdAt)
-        .slice(0, w.calls.length - MAX_CALLS)
-        .forEach((c) => {
-          const i = w.calls.indexOf(c);
-          if (i >= 0) w.calls.splice(i, 1);
-        });
+    if (r.status === "locked" && now >= r.settlesAt) {
+      this.settle(r, this.pending.seed, w, now);
     }
-
-    const visible = w.calls.filter(
-      (c) => c.outcome === "open" || now - c.createdAt < 3_600_000
-    );
-    w.feed = rankFeed(visible, w.tokens, now);
-    tickCalls(
-      w.calls,
-      w.tokens,
-      w.callers,
-      w.feed.map((r) => r.call.id),
-      now,
-      this.rng
-    );
+    if (r.status === "settled" && now >= r.settlesAt + ROUND_SETTLED_MS) {
+      w.history.unshift(r);
+      if (w.history.length > 30) w.history.pop();
+      this.ingestFees(w, now);
+      // Permit regeneration by equipment tier.
+      const tier = EQUIPMENT[w.user.equipmentTier];
+      w.user.permits = Math.min(w.user.permits + tier.permitsPerRound, tier.permitCap);
+      const fresh = this.newRound(now, w.nextPoolUsdg);
+      w.nextPoolUsdg = 0;
+      w.round = fresh.round;
+      this.pending = fresh.pending;
+      this.applySurveyHints(w, fresh.pending.seed);
+    }
 
     this.emit();
   }
 
-  /** The user makes a call. Returns it (already graded by the verdict model). */
-  userCall(tokenId: string, thesis: string): Call {
+  /** User stakes a prospecting permit on a plot. */
+  stakeClaim(plot: number): string | null {
     const w = this.world;
-    const token = w.tokens.get(tokenId);
-    if (!token) throw new Error("Token vanished from the tape");
-    const call = makeCall(w.user, token, thesis, Date.now());
-    w.calls.unshift(call);
-    w.feed = rankFeed(
-      w.calls.filter((c) => c.outcome === "open"),
-      w.tokens,
-      Date.now()
-    );
+    const r = w.round;
+    if (r.status !== "open") return "Claims are locked for settlement.";
+    if (w.user.permits <= 0) return "No prospecting permits left — they regenerate each round.";
+    if (r.claims[plot].includes("you")) return "You already hold this claim.";
+    w.user.permits--;
+    w.user.claimsMade++;
+    r.claims[plot].push("you");
     this.emit();
-    return call;
+    return null;
   }
 
-  /** Preview a verdict before committing the call. */
-  previewVerdict(tokenId: string, thesis: string) {
-    const token = this.world.tokens.get(tokenId);
-    if (!token) return null;
-    return gradeCall(token, this.world.user, thesis, Date.now());
+  /** Refine ore units into $USR (10 ore → 24 USR, sim rate). */
+  refine(): string | null {
+    const u = this.world.user;
+    if (u.oreUnits < 10) return "Need at least 10 ore units to refine.";
+    const batches = Math.floor(u.oreUnits / 10);
+    u.oreUnits -= batches * 10;
+    u.usr += batches * 24;
+    this.emit();
+    return null;
   }
 
-  react(callId: string, kind: "agree" | "echo" | "fade") {
-    const call = this.world.calls.find((c) => c.id === callId);
-    if (!call) return;
-    if (kind === "agree") call.agrees++;
-    else if (kind === "echo") call.echoes++;
-    else call.fades++;
-    call.impressions++;
+  upgrade(): string | null {
+    const u = this.world.user;
+    const next = EQUIPMENT[u.equipmentTier + 1];
+    if (!next) return "Operation fully upgraded.";
+    if (u.usr < next.costUsr || u.oreUnits < next.costOre)
+      return `Needs ${next.costUsr} USR + ${next.costOre} ore.`;
+    u.usr -= next.costUsr;
+    u.oreUnits -= next.costOre;
+    u.equipmentTier++;
+    // New survey gear applies from the current round if still open.
+    if (this.world.round.status === "open") {
+      this.applySurveyHints(this.world, this.pending.seed);
+    }
     this.emit();
+    return null;
   }
 
   private emit() {
@@ -230,12 +380,11 @@ class Store {
     for (const l of this.listeners) l();
   }
 
-  subscribe = (l: Listener) => {
+  subscribe = (l: () => void) => {
     this.listeners.add(l);
     return () => this.listeners.delete(l);
   };
-
-  getSnapshot = (): Snapshot => this.snapshot;
+  getSnapshot = () => this.snapshot;
 }
 
 export const store = new Store();
